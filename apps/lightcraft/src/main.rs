@@ -1638,6 +1638,31 @@ mod tests {
         drop(h);
         let _ = std::fs::remove_dir_all(&d);
     }
+
+    /// Once the user has chosen Continue Without Saving, a photo opened from Finder is handled like a
+    /// drop (it joins the temporary session the banner warns about) instead of waiting.
+    #[test]
+    fn photos_opened_in_a_temporary_session_are_dropped_files() {
+        use lightcraft_ui_egui::headless::{Headless, HeadlessView};
+        const T: std::time::Duration = std::time::Duration::from_secs(20);
+        let d = dir("opened-temporary");
+        let lib = d.join("lib");
+        std::fs::write(&lib, b"not a library").unwrap();
+        let (session, problem) = open_session(false, Some(lib.clone()), false);
+        let mut app = LightcraftApp::new(session, Services::default());
+        app.library_problem = problem;
+        let mut h = Headless::new(app, [1300.0, 900.0], 1.0);
+        h.settle(T);
+        assert_eq!(h.request("ui.clickWidget", serde_json::json!({"id": "button:libraryTemporary"}), T)["ok"], true);
+        h.step_until(T, |h| h.app.library_problem.as_ref().is_some_and(|p| p.dismissed));
+        assert!(h.app.library_problem.as_ref().unwrap().dismissed);
+        let mut raw = HeadlessView::raw_input(h.size, h.pixels_per_point, h.time(), Vec::new());
+        deliver_opened(&mut h.app, &mut raw, vec![d.join("a.png").to_string_lossy().to_string()]);
+        assert!(h.app.library_problem.as_ref().unwrap().pending_import.is_empty(), "not waiting");
+        assert_eq!(raw.dropped_files.len(), 1, "handed over as a dropped file");
+        drop(h);
+        let _ = std::fs::remove_dir_all(&d);
+    }
 }
 
 #[cfg(test)]
