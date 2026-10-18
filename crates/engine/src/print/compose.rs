@@ -584,6 +584,24 @@ pub fn crop_mark_rects(photo: [f64; 4], len: f64, gap: f64, weight: f64, text: &
         .collect()
 }
 
+/// The pieces of the crop mark `mark` (`[x, y, w, h]`) that lie off every photo in `photos`: a
+/// mark never covers a photo, its own or a neighbour closer than the mark's reach.
+pub fn crop_mark_pieces(mark: [f64; 4], photos: &[[f64; 4]]) -> Vec<[f64; 4]> {
+    let [x, y, w, h] = mark;
+    // cut along the mark's length; a photo touching any of its thickness takes that stretch
+    let across = w >= h;
+    let ((a0, a1), (c0, c1)) = if across { ((x, x + w), (y, y + h)) } else { ((y, y + h), (x, x + w)) };
+    let mut runs = vec![(a0, a1)];
+    for &[px, py, pw, ph] in photos {
+        let ((p0, p1), (q0, q1)) = if across { ((px, px + pw), (py, py + ph)) } else { ((py, py + ph), (px, px + pw)) };
+        if q1 <= c0 || q0 >= c1 {
+            continue;
+        }
+        runs = runs.into_iter().flat_map(|(r0, r1): (f64, f64)| [(r0, r1.min(p0)), (r0.max(p1), r1)]).filter(|(r0, r1)| r1 > r0).collect();
+    }
+    runs.into_iter().map(|(r0, r1)| if across { [r0, y, r1 - r0, h] } else { [x, r0, w, r1 - r0] }).collect()
+}
+
 /// [`crop_mark_rects`] for the photo at `r` on a page, in page pixels.
 fn crop_segments(r: &PxRect, len: usize, gap: usize, weight: usize, text: &[&Placed]) -> Vec<(i64, i64, i64, i64)> {
     let photo = [r.x, r.y, r.w, r.h].map(|v| v as f64);
@@ -597,13 +615,13 @@ fn crop_segments(r: &PxRect, len: usize, gap: usize, weight: usize, text: &[&Pla
 
 /// Draws the crop mark `(x, y, w, h)` in `ink`. Marks never cover a photo.
 fn crop_mark(page: &mut Image16, (sx, sy, sw, sh): (i64, i64, i64, i64), photos: &[PxRect], ink: [u16; 3]) {
-    let on_photo = |x: usize, y: usize| photos.iter().any(|p| x >= p.x && x < p.x + p.w && y >= p.y && y < p.y + p.h);
-    for y in sy.max(0)..(sy + sh).min(page.h as i64) {
-        for x in sx.max(0)..(sx + sw).min(page.w as i64) {
-            let (x, y) = (x as usize, y as usize);
-            if !on_photo(x, y) {
-                page.fill_rect(x, y, 1, 1, ink);
-            }
+    let photos: Vec<[f64; 4]> = photos.iter().map(|p| [p.x, p.y, p.w, p.h].map(|v| v as f64)).collect();
+    // whole pixels in, whole pixels out
+    for [x, y, w, h] in crop_mark_pieces([sx, sy, sw, sh].map(|v| v as f64), &photos) {
+        let (x0, y0) = ((x as i64).max(0), (y as i64).max(0));
+        let (x1, y1) = (((x + w) as i64).min(page.w as i64), ((y + h) as i64).min(page.h as i64));
+        if x1 > x0 && y1 > y0 {
+            page.fill_rect(x0 as usize, y0 as usize, (x1 - x0) as usize, (y1 - y0) as usize, ink);
         }
     }
 }
@@ -1203,6 +1221,17 @@ mod tests {
                 assert!(clear, "the mark {:?} crosses the text at ({tx}, {ty}) {} x {}", (x, y, w, h), t.width, t.height);
             }
         }
+    }
+
+    #[test]
+    fn crop_marks_skip_the_photos_they_cross() {
+        // a mark across the page, and one down it, each crossing a neighbouring photo
+        let photo = [40.0, -10.0, 20.0, 20.0];
+        assert_eq!(crop_mark_pieces([0.0, 0.0, 100.0, 2.0], &[photo]), vec![[0.0, 0.0, 40.0, 2.0], [60.0, 0.0, 40.0, 2.0]]);
+        assert_eq!(crop_mark_pieces([45.0, -30.0, 2.0, 30.0], &[photo]), vec![[45.0, -30.0, 2.0, 20.0]]);
+        // a photo beside the mark, not on it, leaves it whole
+        assert_eq!(crop_mark_pieces([0.0, 20.0, 100.0, 2.0], &[photo]), vec![[0.0, 20.0, 100.0, 2.0]]);
+        assert_eq!(crop_mark_pieces([42.0, 0.0, 10.0, 2.0], &[photo]), Vec::<[f64; 4]>::new(), "wholly on the photo");
     }
 
     #[test]

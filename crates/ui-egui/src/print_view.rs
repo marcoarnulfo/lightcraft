@@ -893,15 +893,16 @@ fn page_options(painter: &egui::Painter, st: &PrintSettings, sheet: &Sheet, phot
         if p.page_numbers {
             text.push(painter.text(pos2(area.right(), y), Align2::RIGHT_CENTER, number.to_string(), font(compose::PAGE_TEXT_PT), ink));
         }
+        // fitted with the print's font; the preview's is wider, so it shrinks to the same room
+        let em = compose::PAGE_TEXT_PT as f32 / 72.0 * sheet.scale;
+        let room = text.first().map_or(area.right(), |n: &Rect| n.left() - em) - area.left();
         if p.page_info
+            && room > 0.0
             && let Some((line, pt)) = compose::page_info_fit(&compose::page_info_text(st), inches.w, p.page_numbers.then_some(pages.max(1)))
         {
-            // fitted with the print's font; the preview's is wider, so it shrinks to the same room
-            let em = compose::PAGE_TEXT_PT as f32 / 72.0 * sheet.scale;
-            let room = text.first().map_or(area.right(), |n: &Rect| n.left() - em) - area.left();
             let mut size = font(pt);
             let width = painter.layout_no_wrap(line.clone(), size.clone(), ink).size().x;
-            if width > room && room > 0.0 {
+            if width > room {
                 size.size *= room / width;
             }
             text.push(painter.text(pos2(area.left(), y), Align2::LEFT_CENTER, line, size, ink));
@@ -909,11 +910,14 @@ fn page_options(painter: &egui::Painter, st: &PrintSettings, sheet: &Sheet, phot
     }
     if p.crop_marks {
         let scale = f64::from(sheet.scale);
-        let text: Vec<[f64; 4]> = text.iter().map(|r| [r.left(), r.top(), r.width(), r.height()].map(f64::from)).collect();
-        for r in photos {
-            let photo = [r.left(), r.top(), r.width(), r.height()].map(f64::from);
-            for [x, y, w, h] in compose::crop_mark_rects(photo, compose::CROP_MARK_IN * scale, compose::CROP_MARK_GAP_IN * scale, 1.0, &text) {
-                painter.rect_filled(Rect::from_min_size(pos2(x as f32, y as f32), vec2(w as f32, h as f32)), 0.0, ink);
+        let bounds = |r: &Rect| [r.left(), r.top(), r.width(), r.height()].map(f64::from);
+        let text: Vec<[f64; 4]> = text.iter().map(bounds).collect();
+        let shown: Vec<[f64; 4]> = photos.iter().map(bounds).collect();
+        for photo in &shown {
+            for mark in compose::crop_mark_rects(*photo, compose::CROP_MARK_IN * scale, compose::CROP_MARK_GAP_IN * scale, 1.0, &text) {
+                for [x, y, w, h] in compose::crop_mark_pieces(mark, &shown) {
+                    painter.rect_filled(Rect::from_min_size(pos2(x as f32, y as f32), vec2(w as f32, h as f32)), 0.0, ink);
+                }
             }
         }
     }
