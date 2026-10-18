@@ -543,36 +543,55 @@ impl Marks {
 /// Text laid out, and the top-left corner it is drawn at.
 type Placed = (crate::text::TextLayout, f32, f32);
 
-/// Crop marks for the photo at `r`: at each corner, a line along each of its edges that starts
-/// `gap` past the corner and runs `len` outward, `weight` thick. A mark stops `gap` short of the
-/// page `text` (a photo filling the printable area puts its bottom marks in the footer's margin).
-fn crop_segments(r: &PxRect, len: usize, gap: usize, weight: usize, text: &[&Placed]) -> Vec<(i64, i64, i64, i64)> {
-    let (x0, y0, x1, y1) = (r.x as i64, r.y as i64, (r.x + r.w) as i64, (r.y + r.h) as i64);
-    let (l, g, t) = (len as i64, gap as i64, weight.min(r.w).min(r.h) as i64);
-    // each mark's first pixel row or column, next to the corner, and the way it runs from there
+/// Crop marks for the photo at `photo` (`[x, y, w, h]`, in any unit; the print uses page pixels,
+/// the preview screen points): at each corner, a line along each of its edges that starts `gap`
+/// past the corner and runs `len` outward, `weight` thick, as `[x, y, w, h]` rectangles. A mark
+/// stops `gap` short of the page `text` rectangles (a photo filling the printable area puts its
+/// bottom marks in the footer's margin), at a whole unit so the print's marks stay on pixels.
+pub fn crop_mark_rects(photo: [f64; 4], len: f64, gap: f64, weight: f64, text: &[[f64; 4]]) -> Vec<[f64; 4]> {
+    let [x0, y0, w, h] = photo;
+    let (x1, y1, t) = (x0 + w, y0 + h, weight.min(w).min(h));
+    // each mark: whether it runs across the page, where it starts next to the corner, the way it
+    // runs from there, and where its thickness starts
     let marks = [
-        ((x0 - g - 1, y0), (-1, 0)),
-        ((x1 + g, y0), (1, 0)),
-        ((x0 - g - 1, y1 - t), (-1, 0)),
-        ((x1 + g, y1 - t), (1, 0)),
-        ((x0, y0 - g - 1), (0, -1)),
-        ((x0, y1 + g), (0, 1)),
-        ((x1 - t, y0 - g - 1), (0, -1)),
-        ((x1 - t, y1 + g), (0, 1)),
+        (true, x0 - gap, -1.0, y0),
+        (true, x1 + gap, 1.0, y0),
+        (true, x0 - gap, -1.0, y1 - t),
+        (true, x1 + gap, 1.0, y1 - t),
+        (false, y0 - gap, -1.0, x0),
+        (false, y1 + gap, 1.0, x0),
+        (false, y0 - gap, -1.0, x1 - t),
+        (false, y1 + gap, 1.0, x1 - t),
     ];
-    let gf = gap as f32;
-    let near_text = |x: i64, y: i64, w: i64, h: i64| {
-        let (x0, y0, x1, y1) = (x as f32, y as f32, (x + w) as f32, (y + h) as f32);
-        text.iter().any(|(tl, tx, ty)| x1 > tx - gf && x0 < tx + tl.width + gf && y1 > ty - gf && y0 < ty + tl.height + gf)
-    };
     marks
         .into_iter()
-        .filter_map(|((sx, sy), (dx, dy))| {
-            let (w, h) = if dx != 0 { (1, t) } else { (t, 1) };
-            let n = (0..l).take_while(|k| !near_text(sx + dx * k, sy + dy * k, w, h)).count() as i64;
-            let (ex, ey) = (sx + dx * (n - 1), sy + dy * (n - 1));
-            (n > 0).then_some((sx.min(ex), sy.min(ey), if dx != 0 { n } else { t }, if dy != 0 { n } else { t }))
+        .filter_map(|(across, start, dir, side)| {
+            let room = text.iter().fold(len, |room, &[tx, ty, tw, th]| {
+                let (along, thick) = if across {
+                    ((tx - gap, tx + tw + gap), (ty - gap, ty + th + gap))
+                } else {
+                    ((ty - gap, ty + th + gap), (tx - gap, tx + tw + gap))
+                };
+                if side + t <= thick.0 || side >= thick.1 {
+                    return room;
+                }
+                let ahead = if dir > 0.0 { (along.1 > start).then_some(along.0 - start) } else { (along.0 < start).then_some(start - along.1) };
+                ahead.map_or(room, |d| room.min(d.max(0.0).floor()))
+            });
+            let from = if dir > 0.0 { start } else { start - room };
+            (room > 0.0).then_some(if across { [from, side, room, t] } else { [side, from, t, room] })
         })
+        .collect()
+}
+
+/// [`crop_mark_rects`] for the photo at `r` on a page, in page pixels.
+fn crop_segments(r: &PxRect, len: usize, gap: usize, weight: usize, text: &[&Placed]) -> Vec<(i64, i64, i64, i64)> {
+    let photo = [r.x, r.y, r.w, r.h].map(|v| v as f64);
+    let text: Vec<[f64; 4]> = text.iter().map(|(t, x, y)| [*x, *y, t.width, t.height].map(f64::from)).collect();
+    // whole pixels in, whole pixels out: the casts are exact
+    crop_mark_rects(photo, len as f64, gap as f64, weight as f64, &text)
+        .into_iter()
+        .map(|[x, y, w, h]| (x as i64, y as i64, w as i64, h as i64))
         .collect()
 }
 
