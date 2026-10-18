@@ -502,15 +502,21 @@ impl Marks {
 
     /// Draws the marks of page `number` (one-based) around `photos`, the photos on it.
     fn draw(&self, page: &mut Image16, photos: &[PxRect], number: usize) {
-        if let Some((len, gap, weight)) = self.crop {
-            for r in photos {
-                crop_marks(page, r, len, gap, weight, photos, self.ink);
-            }
-        }
         let (num, info) = self.footer(page.w, page.h, number);
-        for (t, x, y) in num.iter().chain(&info) {
+        let text: Vec<&Placed> = num.iter().chain(&info).collect();
+        for segment in self.crop_segments(photos, &text) {
+            crop_mark(page, segment, photos, self.ink);
+        }
+        for (t, x, y) in text {
             draw_text(page, t, *x, *y, self.ink);
         }
+    }
+
+    /// The crop marks around `photos`, as (x, y, w, h) rectangles of page pixels, kept off the
+    /// page `text`.
+    fn crop_segments(&self, photos: &[PxRect], text: &[&Placed]) -> Vec<(i64, i64, i64, i64)> {
+        let Some((len, gap, weight)) = self.crop else { return Vec::new() };
+        photos.iter().flat_map(|r| crop_segments(r, len, gap, weight, text)).collect()
     }
 
     /// The page number and the Page Info line of page `number` on a `pw` x `ph` page, each laid
@@ -538,28 +544,46 @@ impl Marks {
 type Placed = (crate::text::TextLayout, f32, f32);
 
 /// Crop marks for the photo at `r`: at each corner, a line along each of its edges that starts
-/// `gap` past the corner and runs `len` outward, `weight` thick. Marks never cover a photo.
-fn crop_marks(page: &mut Image16, r: &PxRect, len: usize, gap: usize, weight: usize, photos: &[PxRect], ink: [u16; 3]) {
+/// `gap` past the corner and runs `len` outward, `weight` thick. A mark stops `gap` short of the
+/// page `text` (a photo filling the printable area puts its bottom marks in the footer's margin).
+fn crop_segments(r: &PxRect, len: usize, gap: usize, weight: usize, text: &[&Placed]) -> Vec<(i64, i64, i64, i64)> {
     let (x0, y0, x1, y1) = (r.x as i64, r.y as i64, (r.x + r.w) as i64, (r.y + r.h) as i64);
     let (l, g, t) = (len as i64, gap as i64, weight.min(r.w).min(r.h) as i64);
-    let segments = [
-        (x0 - g - l, y0, l, t),
-        (x1 + g, y0, l, t),
-        (x0 - g - l, y1 - t, l, t),
-        (x1 + g, y1 - t, l, t),
-        (x0, y0 - g - l, t, l),
-        (x0, y1 + g, t, l),
-        (x1 - t, y0 - g - l, t, l),
-        (x1 - t, y1 + g, t, l),
+    // each mark's first pixel row or column, next to the corner, and the way it runs from there
+    let marks = [
+        ((x0 - g - 1, y0), (-1, 0)),
+        ((x1 + g, y0), (1, 0)),
+        ((x0 - g - 1, y1 - t), (-1, 0)),
+        ((x1 + g, y1 - t), (1, 0)),
+        ((x0, y0 - g - 1), (0, -1)),
+        ((x0, y1 + g), (0, 1)),
+        ((x1 - t, y0 - g - 1), (0, -1)),
+        ((x1 - t, y1 + g), (0, 1)),
     ];
+    let gf = gap as f32;
+    let near_text = |x: i64, y: i64, w: i64, h: i64| {
+        let (x0, y0, x1, y1) = (x as f32, y as f32, (x + w) as f32, (y + h) as f32);
+        text.iter().any(|(tl, tx, ty)| x1 > tx - gf && x0 < tx + tl.width + gf && y1 > ty - gf && y0 < ty + tl.height + gf)
+    };
+    marks
+        .into_iter()
+        .filter_map(|((sx, sy), (dx, dy))| {
+            let (w, h) = if dx != 0 { (1, t) } else { (t, 1) };
+            let n = (0..l).take_while(|k| !near_text(sx + dx * k, sy + dy * k, w, h)).count() as i64;
+            let (ex, ey) = (sx + dx * (n - 1), sy + dy * (n - 1));
+            (n > 0).then_some((sx.min(ex), sy.min(ey), if dx != 0 { n } else { t }, if dy != 0 { n } else { t }))
+        })
+        .collect()
+}
+
+/// Draws the crop mark `(x, y, w, h)` in `ink`. Marks never cover a photo.
+fn crop_mark(page: &mut Image16, (sx, sy, sw, sh): (i64, i64, i64, i64), photos: &[PxRect], ink: [u16; 3]) {
     let on_photo = |x: usize, y: usize| photos.iter().any(|p| x >= p.x && x < p.x + p.w && y >= p.y && y < p.y + p.h);
-    for (sx, sy, sw, sh) in segments {
-        for y in sy.max(0)..(sy + sh).min(page.h as i64) {
-            for x in sx.max(0)..(sx + sw).min(page.w as i64) {
-                let (x, y) = (x as usize, y as usize);
-                if !on_photo(x, y) {
-                    page.fill_rect(x, y, 1, 1, ink);
-                }
+    for y in sy.max(0)..(sy + sh).min(page.h as i64) {
+        for x in sx.max(0)..(sx + sw).min(page.w as i64) {
+            let (x, y) = (x as usize, y as usize);
+            if !on_photo(x, y) {
+                page.fill_rect(x, y, 1, 1, ink);
             }
         }
     }
@@ -1133,6 +1157,33 @@ mod tests {
         let room = 1.5 * 72.0 - f64::from(crate::text::TextLayout::new("50", 9.0, false, crate::fonts::CRAFT_FONTS).unwrap().width) - 9.0;
         assert!(f64::from(crate::text::TextLayout::new(&cut, 6.0, false, crate::fonts::CRAFT_FONTS).unwrap().width) <= room);
         assert_eq!(page_info_fit(&line, 0.1, Some(50)), None, "no room at all");
+    }
+
+    #[test]
+    fn crop_marks_stay_clear_of_the_page_text() {
+        let mut s = Session::with_demo();
+        // the review's 4x6 case with crop marks: a zoomed-to-fill photo fills the printable area,
+        // so the bottom marks of its corners run down into the margin the text is centred in
+        let mut set = settings(Style::SingleImage);
+        set.job.ppi = 240.0;
+        set.image.zoom_to_fill = true;
+        set.page = PageStyle { page_numbers: true, page_info: true, crop_marks: true, ..Default::default() };
+        let ids = first_ids(&s, 1);
+        let job = prepare(&mut s, &set, &ids).unwrap();
+        let (pw, ph) = job.pages[0];
+        let photo = job.marks.area.unwrap();
+        let (num, info) = job.marks.footer(pw, ph, 1);
+        let text = [num.as_ref().unwrap(), info.as_ref().unwrap()];
+        let segments = job.marks.crop_segments(&[photo], &text);
+        assert_eq!(segments.len(), 8, "every mark is drawn");
+        for &(x, y, w, h) in &segments {
+            assert!(w > 0 && h > 0, "an empty mark {:?}", (x, y, w, h));
+            for (t, tx, ty) in text {
+                let (x0, y0, x1, y1) = (x as f32, y as f32, (x + w) as f32, (y + h) as f32);
+                let clear = x1 <= *tx || x0 >= tx + t.width || y1 <= *ty || y0 >= ty + t.height;
+                assert!(clear, "the mark {:?} crosses the text at ({tx}, {ty}) {} x {}", (x, y, w, h), t.width, t.height);
+            }
+        }
     }
 
     #[test]
