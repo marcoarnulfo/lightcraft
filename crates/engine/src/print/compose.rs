@@ -36,6 +36,8 @@ pub const CROP_MARK_GAP_IN: f64 = 0.0625;
 pub const CROP_MARK_PT: f64 = 0.5;
 /// Size of the page number and page info text, points.
 pub const PAGE_TEXT_PT: f64 = 9.0;
+/// Smallest size Page Info shrinks to on narrow paper before it is cut short, points.
+pub const MIN_PAGE_TEXT_PT: f64 = 6.0;
 
 /// Lightroom's Image Settings panel.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -148,6 +150,34 @@ pub fn page_info_text(settings: &PrintSettings) -> String {
         PrintProfile::Icc { path } => path.file_stem().map_or_else(|| path.display().to_string(), |n| n.to_string_lossy().into_owned()),
     };
     format!("Print Sharpening: {sharpen} · Profile: {profile} · {:.0} ppi", settings.job.effective_ppi())
+}
+
+/// The Page Info line `info` as it fits a printable area `width_in` wide, leaving an em and the
+/// width of `widest_number` (the last page's number, when Page Numbers is on) free at its right:
+/// the line and its size in points. It keeps [`PAGE_TEXT_PT`] when it fits, shrinks down to
+/// [`MIN_PAGE_TEXT_PT`], then is cut short with an ellipsis; `None` when not even that fits.
+pub fn page_info_fit(info: &str, width_in: f64, widest_number: Option<usize>) -> Option<(String, f64)> {
+    // laid out at one pixel a point, so the result holds at any print resolution
+    let width = |s: &str, pt: f32| crate::text::TextLayout::new(s, pt, false, crate::fonts::CRAFT_FONTS).map_or(0.0, |t| t.width);
+    let pt = PAGE_TEXT_PT as f32;
+    let number = widest_number.map_or(0.0, |n| width(&n.to_string(), pt) + pt);
+    let room = width_in as f32 * 72.0 - number;
+    let full = width(info, pt);
+    if full <= room {
+        return Some((info.to_string(), PAGE_TEXT_PT));
+    }
+    if !(room > 0.0 && full > 0.0) {
+        return None;
+    }
+    // rounded down so the shrunk line doesn't miss the room by a float's width
+    let size = ((pt * room / full * 100.0).floor() / 100.0).max(MIN_PAGE_TEXT_PT as f32);
+    if width(info, size) <= room {
+        return Some((info.to_string(), f64::from(size)));
+    }
+    info.char_indices().rev().find_map(|(i, _)| {
+        let cut = format!("{}…", info.get(..i)?.trim_end());
+        (width(&cut, size) <= room).then_some((cut, f64::from(size)))
+    })
 }
 
 // ---- placement ------------------------------------------------------------------------------
@@ -440,7 +470,8 @@ struct Marks {
     /// Crop mark length, gap from the corner and weight.
     crop: Option<(usize, usize, usize)>,
     numbers: bool,
-    info: Option<String>,
+    /// The Page Info line as it fits beside the page number, and its size.
+    info: Option<(String, f32)>,
     ink: [u16; 3],
     text_px: f32,
     /// The printable area: the text sits in the margin below it, aligned with its sides.
@@ -448,17 +479,24 @@ struct Marks {
 }
 
 impl Marks {
-    fn of(settings: &PrintSettings, ppi: f64, pw: usize, ph: usize) -> Self {
+    /// The marks of a print of `pages` pages of `pw` x `ph` pixels.
+    fn of(settings: &PrintSettings, ppi: f64, pw: usize, ph: usize, pages: usize) -> Self {
         let on = has_page_options(settings.layout.style);
         let page = &settings.page;
         let px = |inches: f64| (inches * ppi).round() as usize;
+        let numbers = on && page.page_numbers;
+        let printable = settings.layout.printable().ok();
+        let width_in = printable.as_ref().map_or(pw as f64 / ppi, |a| a.w);
         Marks {
             crop: (on && page.crop_marks).then(|| (px(CROP_MARK_IN), px(CROP_MARK_GAP_IN), px(CROP_MARK_PT / 72.0).max(1))),
-            numbers: on && page.page_numbers,
-            info: (on && page.page_info).then(|| page_info_text(settings)),
+            numbers,
+            info: (on && page.page_info)
+                .then(|| page_info_fit(&page_info_text(settings), width_in, numbers.then_some(pages.max(1))))
+                .flatten()
+                .map(|(line, pt)| (line, (pt / 72.0 * ppi) as f32)),
             ink: rec2020_from_srgb8(mark_ink(page.background)),
             text_px: (PAGE_TEXT_PT / 72.0 * ppi) as f32,
-            area: settings.layout.printable().ok().and_then(|a| px_rect(&a, ppi, pw, ph)),
+            area: printable.and_then(|a| px_rect(&a, ppi, pw, ph)),
         }
     }
 
@@ -469,23 +507,35 @@ impl Marks {
                 crop_marks(page, r, len, gap, weight, photos, self.ink);
             }
         }
-        let area = self.area.unwrap_or(PxRect { x: 0, y: 0, w: page.w, h: page.h });
-        let (area_bottom, page_h) = ((area.y + area.h) as f32, page.h as f32);
-        // centred in the bottom margin, and on the paper when the margin is thinner than the text
-        let top = |h: f32| (area_bottom + (page_h - area_bottom - h) / 2.0).clamp(0.0, (page_h - h).max(0.0));
-        if self.numbers
-            && let Some(t) = crate::text::TextLayout::new(&number.to_string(), self.text_px, false, crate::fonts::CRAFT_FONTS)
-        {
-            let x = ((area.x + area.w) as f32 - t.width).max(0.0);
-            draw_text(page, &t, x, top(t.height), self.ink);
-        }
-        if let Some(info) = &self.info
-            && let Some(t) = crate::text::TextLayout::new(info, self.text_px, false, crate::fonts::CRAFT_FONTS)
-        {
-            draw_text(page, &t, area.x as f32, top(t.height), self.ink);
+        let (num, info) = self.footer(page.w, page.h, number);
+        for (t, x, y) in num.iter().chain(&info) {
+            draw_text(page, t, *x, *y, self.ink);
         }
     }
+
+    /// The page number and the Page Info line of page `number` on a `pw` x `ph` page, each laid
+    /// out with the top-left corner it is drawn at.
+    fn footer(&self, pw: usize, ph: usize, number: usize) -> (Option<Placed>, Option<Placed>) {
+        let area = self.area.unwrap_or(PxRect { x: 0, y: 0, w: pw, h: ph });
+        let (area_bottom, page_h) = ((area.y + area.h) as f32, ph as f32);
+        // centred in the bottom margin, and on the paper when the margin is thinner than the text
+        let top = |h: f32| (area_bottom + (page_h - area_bottom - h) / 2.0).clamp(0.0, (page_h - h).max(0.0));
+        let line = |s: &str, px: f32| crate::text::TextLayout::new(s, px, false, crate::fonts::CRAFT_FONTS);
+        let num = self.numbers.then(|| line(&number.to_string(), self.text_px)).flatten().map(|t| {
+            let x = ((area.x + area.w) as f32 - t.width).max(0.0);
+            let y = top(t.height);
+            (t, x, y)
+        });
+        let info = self.info.as_ref().and_then(|(info, px)| line(info, *px)).map(|t| {
+            let y = top(t.height);
+            (t, area.x as f32, y)
+        });
+        (num, info)
+    }
 }
+
+/// Text laid out, and the top-left corner it is drawn at.
+type Placed = (crate::text::TextLayout, f32, f32);
 
 /// Crop marks for the photo at `r`: at each corner, a line along each of its edges that starts
 /// `gap` past the corner and runs `len` outward, `weight` thick. Marks never cover a photo.
@@ -659,7 +709,7 @@ pub fn prepare(session: &mut Session, settings: &PrintSettings, photos: &[PhotoI
         ppi: ppi as f32,
         background: rec2020_from_srgb8(settings.page.background),
         style,
-        marks: Marks::of(&settings, ppi, pw, ph),
+        marks: Marks::of(&settings, ppi, pw, ph, plan.len()),
         color: settings.job.color.clone(),
     })
 }
@@ -1048,6 +1098,54 @@ mod tests {
         for p in &package {
             assert_eq!(inked(p, 0, 400, 550, 600) + inked(p, 0, 400, 0, 50), 0);
         }
+    }
+
+    /// The footer of page 1 with both Page Number and Page Info on: the printable area's left and
+    /// right edges and the two lines' spans, in page pixels.
+    fn footer_spans(s: &mut Session, set: &PrintSettings) -> ((f32, f32), (f32, f32), (f32, f32), String) {
+        let ids = first_ids(s, 1);
+        let job = prepare(s, set, &ids).unwrap();
+        let (pw, ph) = job.pages[0];
+        let area = job.marks.area.unwrap();
+        let (num, info) = job.marks.footer(pw, ph, 1);
+        let (num, info) = (num.unwrap(), info.unwrap());
+        let text = job.marks.info.clone().unwrap().0;
+        ((area.x as f32, (area.x + area.w) as f32), (num.1, num.1 + num.0.width), (info.1, info.1 + info.0.width), text)
+    }
+
+    #[test]
+    fn page_info_fits_beside_the_page_number_on_small_paper() {
+        let mut s = Session::with_demo();
+        // the review's case: print.set {layout: {page: {paper: "4x6", margins: 0.5 all round}},
+        // page: {pageInfo: true, pageNumbers: true}, job: {ppi: 240}}
+        let mut set = settings(Style::SingleImage);
+        set.job.ppi = 240.0;
+        set.page = PageStyle { page_numbers: true, page_info: true, ..Default::default() };
+        let ((left, right), num, info, _) = footer_spans(&mut s, &set);
+        assert!(info.0 >= left && info.1 <= right, "page info {info:?} inside the printable area {left}..{right}");
+        assert!(info.1 < num.0, "page info {info:?} ends before the page number {num:?}");
+        assert!(num.1 <= right);
+        // narrower still, it stops shrinking at 6 pt and is cut short
+        let line = page_info_text(&set);
+        let (cut, pt) = page_info_fit(&line, 1.5, Some(50)).unwrap();
+        assert_eq!(pt, MIN_PAGE_TEXT_PT);
+        assert!(cut.ends_with('…') && line.starts_with(cut.trim_end_matches('…')), "{cut}");
+        let room = 1.5 * 72.0 - f64::from(crate::text::TextLayout::new("50", 9.0, false, crate::fonts::CRAFT_FONTS).unwrap().width) - 9.0;
+        assert!(f64::from(crate::text::TextLayout::new(&cut, 6.0, false, crate::fonts::CRAFT_FONTS).unwrap().width) <= room);
+        assert_eq!(page_info_fit(&line, 0.1, Some(50)), None, "no room at all");
+    }
+
+    #[test]
+    fn page_info_keeps_its_size_on_letter_paper() {
+        let mut s = Session::with_demo();
+        let mut set = PrintSettings::default();
+        set.job.ppi = 240.0;
+        set.page = PageStyle { page_numbers: true, page_info: true, ..Default::default() };
+        let (_, num, info, text) = footer_spans(&mut s, &set);
+        assert_eq!(text, page_info_text(&set), "the whole line");
+        let full = crate::text::TextLayout::new(&text, (PAGE_TEXT_PT / 72.0 * 240.0) as f32, false, crate::fonts::CRAFT_FONTS).unwrap();
+        assert_eq!(info.1 - info.0, full.width, "at {PAGE_TEXT_PT} pt");
+        assert!(info.1 < num.0);
     }
 
     #[test]

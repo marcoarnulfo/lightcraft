@@ -626,7 +626,7 @@ fn preview(app: &mut LightcraftApp, ui: &mut Ui, t: &Tokens, pu: &mut PrintUi, s
             register(&ctx, format!("print:gridcell:{i}"), rect);
             shown.extend(paint_cell(app, &painter, t, st, rect, *photo, &sheet, r));
         }
-        page_options(&painter, st, &sheet, &shown, pu.page + 1);
+        page_options(&painter, st, &sheet, &shown, pu.page + 1, pages);
     }
 
     // footer: page navigation and the selected cell
@@ -877,7 +877,7 @@ fn paint_cell(
 /// The Page Options as the print draws them ([`compose`]): crop marks at the corners of each
 /// photo, the page number at the bottom right and the print settings at the bottom left.
 /// Packages draw none of them, as the print doesn't ([`compose::has_page_options`]).
-fn page_options(painter: &egui::Painter, st: &PrintSettings, sheet: &Sheet, photos: &[Rect], number: usize) {
+fn page_options(painter: &egui::Painter, st: &PrintSettings, sheet: &Sheet, photos: &[Rect], number: usize, pages: usize) {
     if !compose::has_page_options(st.layout.style) {
         return;
     }
@@ -896,15 +896,17 @@ fn page_options(painter: &egui::Painter, st: &PrintSettings, sheet: &Sheet, phot
             }
         }
     }
-    let Ok(area) = st.layout.printable() else { return };
-    let area = sheet.rect(&area);
-    let font = egui::FontId::proportional((compose::PAGE_TEXT_PT as f32 / 72.0 * sheet.scale).max(4.0));
+    let Ok(inches) = st.layout.printable() else { return };
+    let area = sheet.rect(&inches);
+    let font = |pt: f64| egui::FontId::proportional((pt as f32 / 72.0 * sheet.scale).max(4.0));
     let y = (area.bottom() + sheet.page.bottom()) / 2.0;
     if p.page_numbers {
-        painter.text(pos2(area.right(), y), Align2::RIGHT_CENTER, number.to_string(), font.clone(), ink);
+        painter.text(pos2(area.right(), y), Align2::RIGHT_CENTER, number.to_string(), font(compose::PAGE_TEXT_PT), ink);
     }
-    if p.page_info {
-        painter.text(pos2(area.left(), y), Align2::LEFT_CENTER, compose::page_info_text(st), font, ink);
+    if p.page_info
+        && let Some((line, pt)) = compose::page_info_fit(&compose::page_info_text(st), inches.w, p.page_numbers.then_some(pages.max(1)))
+    {
+        painter.text(pos2(area.left(), y), Align2::LEFT_CENTER, line, font(pt), ink);
     }
 }
 
