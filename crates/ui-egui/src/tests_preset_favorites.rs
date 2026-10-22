@@ -49,3 +49,46 @@ fn a_starred_preset_is_listed_first_in_favorites_and_stays_in_its_group() {
     assert!(rect(&h, "presetFavorites").is_none(), "un-starring the last favourite removes the group");
     assert!(rect(&h, "presetFav:lc.bw-selenium").is_none());
 }
+
+/// The star on a row's right (shown on hover, as in the profile browser) toggles the favourite
+/// without applying the preset; a click elsewhere on the row still applies it (#2017).
+#[test]
+fn preset_star_lists_favourites_first() {
+    let app = LightcraftApp::new(lightcraft_engine::Session::with_demo(), Services { png: None, ..Default::default() });
+    let mut h = Headless::new(app, [1400.0, 900.0], 1.0);
+    let t = Duration::from_secs(10);
+    h.request("ui.set", json!({"view": "detail"}), t);
+    h.request("engine.execute", json!({"command": "panel.presets"}), t);
+    h.settle(SETTLE);
+    let id = h.app.session.active().unwrap();
+    let history = |h: &Headless| h.app.session.catalog.photo(id).unwrap().history.len();
+    let before = history(&h);
+    let fav = |h: &Headless| h.app.session.presets.iter().find(|p| p.id == "lc.warm-glow").map(|p| p.favorite);
+    assert!(rect(&h, "presetFavorites").is_none(), "no Favorites group without a favourite");
+
+    let r = h.request("ui.clickWidget", json!({"id": "presetStar:lc.warm-glow"}), t);
+    assert_eq!(r["ok"], true, "{r}");
+    assert_eq!(fav(&h), Some(true));
+    assert_eq!(history(&h), before, "the star doesn't apply the preset");
+    h.step();
+    h.step();
+    let top = |h: &Headless, w: &str| rect(h, w).map(|r| r.top());
+    assert!(rect(&h, "presetFav:lc.warm-glow").is_some() && rect(&h, "preset:lc.warm-glow").is_some(), "listed first and in its group");
+    assert!(top(&h, "presetFavorites") < top(&h, "presetGroup:Color"), "Favorites first");
+
+    // a click on the favourite's row applies it
+    let r = h.request("ui.clickWidget", json!({"id": "presetFav:lc.warm-glow"}), t);
+    assert_eq!(r["ok"], true, "{r}");
+    assert_eq!(history(&h), before + 1);
+    assert_eq!(fav(&h), Some(true), "the row click leaves the star alone");
+
+    // its star there takes it out of the group, and the empty group goes
+    let r = h.request("ui.clickWidget", json!({"id": "presetFavStar:lc.warm-glow"}), t);
+    assert_eq!(r["ok"], true, "{r}");
+    assert_eq!(fav(&h), Some(false));
+    assert_eq!(history(&h), before + 1, "nor does the star in Favorites");
+    h.step();
+    h.step();
+    assert!(rect(&h, "presetFavorites").is_none() && rect(&h, "presetFav:lc.warm-glow").is_none());
+    h.settle(SETTLE);
+}

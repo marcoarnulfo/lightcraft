@@ -1,7 +1,7 @@
-//! The Presets column (opens to the left of the Edit panel): grouped presets with hover preview
-//! (the loupe shows the photo with the preset while the pointer rests on it; nothing is
-//! committed), optional live thumbnails, amount slider, create/favourite, import/export of preset
-//! files.
+//! The Presets column (opens to the left of the Edit panel): grouped presets (Favorites first,
+//! as in the profile browser) with hover preview (the loupe shows the photo with the preset while
+//! the pointer rests on it; nothing is committed), optional live thumbnails, amount slider,
+//! create/favourite (the star on a row, or its menu), import/export of preset files.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -224,8 +224,13 @@ pub fn show(app: &mut LightcraftApp, ui: &mut egui::Ui) {
                         text_x = tr.right() + 10.0;
                     }
                     ui.painter().text(pos2(text_x, r.center().y), Align2::LEFT_CENTER, &name, t.font(13.0), t.text_label);
-                    if fav {
-                        paint(ui.painter(), Rect::from_center_size(pos2(r.right() - 20.0, r.center().y), vec2(16.0, 16.0)), Icon::StarFilled, t.star);
+                    // favourite star (always shown when set, on hover otherwise); a click on it toggles
+                    let star = Rect::from_center_size(pos2(r.right() - 20.0, r.center().y), vec2(16.0, 16.0));
+                    register(ui.ctx(), if favorites { format!("presetFavStar:{pid}") } else { format!("presetStar:{pid}") }, star);
+                    let over_star = resp.hover_pos().is_some_and(|q| star.expand(3.0).contains(q));
+                    if fav || resp.hovered() {
+                        let color = if fav || over_star { t.star } else { t.text_dim };
+                        paint(ui.painter(), star, if fav { Icon::StarFilled } else { Icon::Star }, color);
                     }
                     // resting on a preset previews it in the loupe (no history entry)
                     if resp.hovered()
@@ -237,7 +242,10 @@ pub fn show(app: &mut LightcraftApp, ui: &mut egui::Ui) {
                             ui.data_mut(|d| d.insert_temp(egui::Id::new("last-preset-hover"), (id, pr.clone(), label)));
                         }
                     }
-                    if resp.clicked() && app.run("preset.apply", json!({"id": pid, "amount": 100})).is_ok() {
+                    let on_star = resp.clicked() && resp.interact_pointer_pos().is_some_and(|q| star.expand(3.0).contains(q));
+                    if on_star {
+                        let _ = app.run("preset.favorite", json!({"id": pid}));
+                    } else if resp.clicked() && app.run("preset.apply", json!({"id": pid, "amount": 100})).is_ok() {
                         AppliedByPhoto::remember(ui.ctx(), &app.session, &pid);
                         ui.data_mut(|d| d.insert_temp(amt_id, AppliedPreset::new(&app.session, pid.clone(), 100.0)));
                         ui.data_mut(|d| d.remove::<(lightcraft_catalog::PhotoId, Preset, String)>(egui::Id::new("last-preset-hover")));
